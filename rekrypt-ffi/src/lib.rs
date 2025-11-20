@@ -15,9 +15,10 @@ use std::sync::Mutex;
 
 use recrypt::api::{
     CryptoOps, DefaultRng, Ed25519, Ed25519Ops, KeyGenOps, PrivateKey, PublicKey, RandomBytes,
-    Recrypt, Sha256, SigningKeypair,
+    Recrypt, Sha256, SigningKeypair,Plaintext,EncryptedMessage,AuthHash,PublicSigningKey,Ed25519Signature,EncryptedTempKey,TransformBlock,EncryptedValue,
 };
 use rekrypt::serialization::{SerializableEncryptedValue, SerializableTransformKey};
+use recrypt::nonemptyvec::NonEmptyVec;
 
 // Thread-safe error storage
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
@@ -234,6 +235,220 @@ pub extern "C" fn rekrypt_generate_transform_key(
         *out_transform_key = ByteArray::from_vec(serialized);
     }
     0
+}
+
+/// Decrypt transformed encrypted data
+///
+/// IMPORTANT: This must be called for every ByteArray returned by FFI functions
+/// to prevent memory leaks.
+#[no_mangle]
+pub extern "C" fn rekrypt_decrypt(
+    bob_private_key: *const u8,
+    bob_private_key_len: usize,
+
+    eph_pk_x_ptr: *const u8,
+    eph_pk_x_len: usize,
+    eph_pk_y_ptr: *const u8,
+    eph_pk_y_len: usize,
+
+    enc_msg_ptr: *const u8,
+    enc_msg_len: usize,
+
+    auth_hash_ptr: *const u8,
+    auth_hash_len: usize,
+
+    pub_sign_key_ptr: *const u8,
+    pub_sign_key_len: usize,
+
+    signature_ptr: *const u8,
+    signature_len: usize,
+    
+    // transform_blocks: an array of TransformBlock pointers
+    pub_x_ptr: *const u8,
+    pub_x_len: usize,
+    pub_y_ptr: *const u8,
+    pub_y_len: usize,
+    etk_ptr: *const u8,
+    etk_len: usize,
+    rand_pub_x_ptr: *const u8,
+    rand_pub_x_len: usize,
+    rand_pub_y_ptr: *const u8,
+    rand_pub_y_len: usize,
+    rand_etk_ptr: *const u8,
+    rand_etk_len: usize,
+
+    out_decrypted: *mut ByteArray,
+) -> i32 {
+    unsafe {
+    clear_error();
+
+    if eph_pk_x_ptr.is_null() || eph_pk_y_ptr.is_null()
+            || enc_msg_ptr.is_null() || auth_hash_ptr.is_null()
+            || pub_sign_key_ptr.is_null()
+            || signature_ptr.is_null()
+    {
+        set_error("Null pointer in encryptedValue arguments");
+        return -1;
+    }
+
+    // --- Parse PublicKey(ephemeral) ---
+    let pk_x = std::slice::from_raw_parts(eph_pk_x_ptr, eph_pk_x_len);
+    let pk_y = std::slice::from_raw_parts(eph_pk_y_ptr, eph_pk_y_len);
+    let eph_pk = match PublicKey::new_from_slice((pk_x, pk_y)) {
+        Ok(p) => p, // 将 PublicKey 转换为原始指针
+        Err(e) => {
+            set_error(format!("Failed to new eph_pk: {}", e));
+            return -1 // 失败时返回空指针
+        },
+    };
+
+    // --- Parse EncryptedMessage ---
+    let enc_msg_bytes = std::slice::from_raw_parts(enc_msg_ptr, enc_msg_len);
+    let enc_msg = match EncryptedMessage::new_from_slice(enc_msg_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(format!("Failed to new enc_msg: {}", e));
+            return -1 // 失败时返回空指针
+        },
+    };
+
+    // --- Parse AuthHash ---
+    let auth_hash_bytes = std::slice::from_raw_parts(auth_hash_ptr, auth_hash_len);
+    let auth_hash = match AuthHash::new_from_slice(auth_hash_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(format!("Failed to new auth_hash: {}", e));
+            return -1
+        },
+    };
+
+
+    // --- Parse PublicSigningKey ---
+    let pub_sign_key_bytes =
+        std::slice::from_raw_parts(pub_sign_key_ptr, pub_sign_key_len);
+    let pub_sign_key = match PublicSigningKey::new_from_slice(pub_sign_key_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(format!("Failed to new pub_sign_key: {}", e));
+            return -1 
+        },
+    };
+
+    // --- Parse Signature ---
+    let sig_bytes =
+        std::slice::from_raw_parts(signature_ptr, signature_len);
+    let signature = match Ed25519Signature::new_from_slice(sig_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            set_error(format!("Failed to new signature: {}", e));
+            return -1
+        },
+    };
+
+    if pub_x_ptr.is_null() || pub_y_ptr.is_null() || etk_ptr.is_null() || rand_pub_x_ptr.is_null() || rand_pub_y_ptr.is_null() || rand_etk_ptr.is_null()
+    {
+        set_error("Null pointer in transform_blocks arguments");
+        return -1;
+    }
+
+    let pub_x = slice::from_raw_parts(pub_x_ptr, pub_x_len);
+    let pub_y = slice::from_raw_parts(pub_y_ptr, pub_y_len);
+    let etk = slice::from_raw_parts(etk_ptr, etk_len);
+    let rand_pub_x = slice::from_raw_parts(rand_pub_x_ptr, rand_pub_x_len);
+    let rand_pub_y = slice::from_raw_parts(rand_pub_y_ptr, rand_pub_y_len);
+    let rand_etk = slice::from_raw_parts(rand_etk_ptr, rand_etk_len);
+
+    // create PublicKey and EncryptedTempKey using api helpers that parse slices
+    let pk = match PublicKey::new_from_slice((pub_x, pub_y)) {
+        Ok(x) => x,
+        Err(e) => {
+            set_error(format!("Failed to new pk: {}", e));
+            return -1
+        },
+    };
+
+    let etk_val = match EncryptedTempKey::new_from_slice(etk) {
+        Ok(x) => x,
+        Err(e) => {
+            set_error(format!("Failed to new etk_val: {}", e));
+            return -1
+        },
+    };
+
+    let rand_pk = match PublicKey::new_from_slice((rand_pub_x, rand_pub_y)) {
+        Ok(x) => x,
+        Err(e) => {
+            set_error(format!("Failed to new rand_pk: {}", e));
+            return -1
+        },
+    };
+
+    let rand_etk_val = match EncryptedTempKey::new_from_slice(rand_etk) {
+        Ok(x) => x,
+        Err(e) => {
+            set_error(format!("Failed to new rand_etk_val: {}", e));
+            return -1
+        },
+    };
+
+    // call the public constructor; we assume it returns a Result<TransformBlock>
+    let transformBlock: TransformBlock = match TransformBlock::new(&pk, &etk_val, &rand_pk, &rand_etk_val) {
+        Ok(tb) => tb,
+        Err(e) => {
+            set_error(format!("Failed to new transformBlock: {}", e));
+            return -1 // 失败时返回空指针
+        },
+    };
+    
+    // 构造 blocks 列表
+    let mut blocks: Vec<TransformBlock> = Vec::new();
+    blocks.push(transformBlock.clone());
+
+    // NonEmptyVec<T>::new(first, rest)
+    let first = blocks.remove(0);          // first element
+    let transform_blocks = NonEmptyVec::new(first, blocks); // rest is empty vec
+
+
+    // --- Construct enum variant ---
+    let value = EncryptedValue::TransformedValue {
+        ephemeral_public_key: eph_pk,
+        encrypted_message: enc_msg,
+        auth_hash,
+        transform_blocks,
+        public_signing_key: pub_sign_key,
+        signature,
+    };
+
+    // Convert to slices
+    let bob_private_key_bytes =
+        unsafe { slice::from_raw_parts(bob_private_key, bob_private_key_len) };
+        
+    // Parse delegator private key
+    let private_key = match PrivateKey::new_from_slice(bob_private_key_bytes) {
+        Ok(k) => k,
+        Err(e) => {
+            set_error(format!("Invalid delegatee private key: {:?}", e));
+            return -1 
+        }
+    };
+    
+    let recrypt = Recrypt::<Sha256, Ed25519, RandomBytes<DefaultRng>>::new();
+
+    let pt: Plaintext = match recrypt.decrypt(value, &private_key) {
+        Ok(ev) => ev,
+        Err(e) => {
+            set_error(format!("Decryption to Bob failed: {:?}", e));
+            return -1
+        }
+    };
+
+    let decrypted_bytes = pt.bytes().to_vec();
+
+    unsafe {
+        *out_decrypted = ByteArray::from_vec(decrypted_bytes);
+    }
+    0
+    }
 }
 
 /// Transform encrypted data using a transform key
@@ -464,6 +679,8 @@ pub extern "C" fn rekrypt_proxy_transform(
     }
     0
 }
+
+
 
 /// Free a ByteArray allocated by Rust
 ///
